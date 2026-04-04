@@ -1,0 +1,1 @@
+savedcmd_Module.symvers :=  /home/xrander24/HSSE/2026_linux/linux-6.19/scripts/mod/modpost -M          -o Module.symvers -T modules.order -i /home/xrander24/HSSE/2026_linux/linux-6.19/Module.symvers -e 
