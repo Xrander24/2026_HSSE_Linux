@@ -7,8 +7,8 @@
 #include <linux/uaccess.h>
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Student");
-MODULE_DESCRIPTION("Telegram proxy via FIFO");
+MODULE_AUTHOR("Xrander24");
+MODULE_DESCRIPTION("Telegram via FIFO");
 
 #define NUM_CHATS 3
 #define MAX_MSG_LEN 512

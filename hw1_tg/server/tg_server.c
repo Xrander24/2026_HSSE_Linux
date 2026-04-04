@@ -28,24 +28,20 @@ static const char *uid_to_name(unsigned int uid) {
   case 0:
     return "root";
   case 1000:
-    return "Мария";
-  case 1001:
-    return "Владимир";
-  case 1002:
-    return "Алиса";
+    return "user_name";
   default:
     return NULL;
   }
 }
 
 static void init_chats(void) {
-  strcpy(chats[0].msgs[0].text, "[Мария] Привет!");
+  strcpy(chats[0].msgs[0].text, "[Maria] Hi!");
   chats[0].count = 1;
-  strcpy(chats[1].msgs[0].text, "[Алиса] Всем привет!");
+  strcpy(chats[1].msgs[0].text, "[Alice] Hi everyone!");
   chats[1].count = 1;
 
-  strcpy(chats[2].msgs[0].text, "[Максим] Кто идёт на митап?");
-  strcpy(chats[2].msgs[1].text, "[Анна] Я иду!");
+  strcpy(chats[2].msgs[0].text, "[Max] Hi!");
+  strcpy(chats[2].msgs[1].text, "[Anna] Hi Max, change your name please");
   chats[2].count = 2;
 }
 
@@ -63,7 +59,7 @@ static void chat_add(int id, const char *text) {
 }
 
 static void process(const char *req, char *resp, int resp_max) {
-  printf("[server] запрос: %s\n", req);
+  printf("[server] request: %s\n", req);
   fflush(stdout);
 
   if (strncmp(req, "READ:", 5) == 0) {
@@ -80,7 +76,7 @@ static void process(const char *req, char *resp, int resp_max) {
       pos += snprintf(resp + pos, resp_max - pos, "%s\n", c->msgs[i].text);
 
     if (pos == 0)
-      snprintf(resp, resp_max, "(нет сообщений)\n");
+      snprintf(resp, resp_max, "(No messages)\n");
     return;
   }
 
@@ -135,7 +131,7 @@ static void process(const char *req, char *resp, int resp_max) {
     snprintf(full_msg, sizeof(full_msg), "[%s] %s", name, msg);
 
     chat_add(id, full_msg);
-    printf("[server] chat_%d ← %s\n", id, full_msg);
+    printf("[server] chat_%d <- %s\n", id, full_msg);
     fflush(stdout);
     snprintf(resp, resp_max, "OK\n");
     return;
@@ -163,9 +159,9 @@ int main(void) {
   mkfifo(FIFO_REQ, 0666);
   mkfifo(FIFO_RESP, 0666);
 
-  printf("[server] запущен\n");
-  printf("[server] чатов: %d", NUM_CHATS);
-  printf("[server] ожидаем запросы от модуля...\n");
+  printf("[server] start\n");
+  printf("[server] chat count: %d", NUM_CHATS);
+  printf("[server] waitng request from module...\n");
   fflush(stdout);
 
   while (running) {
@@ -196,12 +192,12 @@ int main(void) {
     write(resp_fd, resp, strlen(resp));
     close(resp_fd);
 
-    printf("[server] ответ: %s", resp);
+    printf("[server] response: %s", resp);
     fflush(stdout);
   }
 
   unlink(FIFO_REQ);
   unlink(FIFO_RESP);
-  printf("[server] остановлен\n");
+  printf("[server] shutdown\n");
   return 0;
 }
