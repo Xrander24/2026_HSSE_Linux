@@ -1,27 +1,29 @@
 # Page Fault Tracer (pft)
 
-Educational Linux kernel module that traces x86 page faults and exposes
-statistics to userspace. Built against Linux 6.19, runs in the course
-QEMU + busybox initramfs setup.
+Учебный модуль ядра Linux, который трейсит page fault'ы на x86 и
+отдаёт статистику в userspace.
 
-## What it does
+## Что делает
 
-For every page fault on the system the module:
+На каждый page fault в системе модуль:
 
-1. Bumps global atomic counters (total, user, kernel, write, CoW hint).
-2. Records a fixed-size binary event into a `kfifo` ring buffer.
-3. Updates a per-PID hash table (count + last `comm`).
+1. Инкрементирует глобальные atomic-счётчики (total, user, kernel,
+   write, эвристика CoW).
+2. Записывает фиксированной длины бинарную запись в кольцевой буфер
+   `kfifo`.
+3. Обновляет per-PID hash-таблицу (счётчик + последнее `comm`).
 
-Userspace can:
+Userspace может:
 
-- read raw events from `/sys/kernel/debug/pft/events` (binary stream),
-- read aggregated stats and top-PIDs from `/proc/pft/stats` (text),
-- send commands to `/proc/pft/control` (reset, set/clear PID filter).
+- читать сырой поток событий из `/sys/kernel/debug/pft/events`,
+- читать агрегированную статистику и топ-PID'ов из `/proc/pft/stats`,
+- отправлять команды в `/proc/pft/control` (reset, поставить/снять
+  PID-фильтр).
 
-A small reader (`pft-ctl`) and a micro-bench (`pft-bench`) are shipped
-alongside the module.
+В комплекте с модулем поставляются маленький reader (`pft-ctl`) и
+микробенч (`pft-bench`).
 
-## Architecture
+## Архитектура
 
 ```
    userspace
@@ -59,103 +61,106 @@ alongside the module.
         (defined in arch/x86/mm/fault.c)
 ```
 
-## Why these design choices
+## Почему такие технические решения
 
-**Tracepoints, not kprobes / not syscall hooks.**
-`exceptions:page_fault_user` / `page_fault_kernel` are static tracepoints
-with a stable signature: `(unsigned long address, struct pt_regs *regs,
-unsigned long error_code)`. They are part of the kernel ABI for
-observability tooling - they don't move between versions the way kprobe
-targets do, and they cost nothing when no probe is attached (a single
-static-branch check).
+**Tracepoint'ы, а не kprobe и не подмена syscall'ов.**
+`exceptions:page_fault_user` / `page_fault_kernel` — это статические
+tracepoint'ы со стабильной сигнатурой: `(unsigned long address,
+struct pt_regs *regs, unsigned long error_code)`. Они являются частью
+ABI ядра для observability-инструментов: не переезжают между версиями,
+как переменчивые kprobe-таргеты, и почти ничего не стоят, когда никто
+не подписан (один static-branch).
 
-**Lookup-by-name registration, not `register_trace_*()`.**
-`arch/x86/mm/fault.c` creates `__tracepoint_page_fault_user` (via
-`CREATE_TRACE_POINTS`) but does *not* call
-`EXPORT_TRACEPOINT_SYMBOL_GPL()` for it. An out-of-tree module that
-expands the `register_trace_page_fault_user()` macro fails to link with
-`modpost: __tracepoint_page_fault_user undefined`. The standard
-workaround - also used by bpftrace and SystemTap - is to walk the
-kernel-wide list with `for_each_kernel_tracepoint()`, match by name,
-and call `tracepoint_probe_register(tp, probe, NULL)`. Both helpers are
-exported `GPL`.
+**Регистрация по имени, а не через `register_trace_*()`.**
+В `arch/x86/mm/fault.c` через `CREATE_TRACE_POINTS` создаётся символ
+`__tracepoint_page_fault_user`, но `EXPORT_TRACEPOINT_SYMBOL_GPL()`
+для него **не вызывается**. Поэтому out-of-tree модуль, который
+раскрывает макрос `register_trace_page_fault_user()`, не линкуется:
+`modpost: __tracepoint_page_fault_user undefined`. Стандартный обход
+(его же применяют bpftrace и SystemTap) — пройти список всех
+tracepoint'ов ядра через `for_each_kernel_tracepoint()`, найти по имени
+и зарегистрироваться через `tracepoint_probe_register(tp, probe, NULL)`.
+Оба helper'а экспортированы как `EXPORT_SYMBOL_GPL`.
 
-**Atomic context discipline.**
-Probes run with preemption disabled and inside an RCU read-side critical
-section. The code therefore:
+**Дисциплина atomic-контекста.**
+Probe-функции вызываются с выключенным preempt'ом и внутри
+RCU read-side critical section. Поэтому в коде:
 
-- never sleeps - no mutex, no `down_*`, no `GFP_KERNEL`,
-- only uses `atomic64_inc`, `kfifo_in_spinlocked`, `kmalloc(GFP_ATOMIC)`,
-  spinlocks (`spin_lock_irqsave`),
-- never copies to userspace from the probe path - all userspace transfer
-  happens in process context inside `pft_events_read`.
+- никаких sleep'ов — нет mutex'ов, нет `down_*`, нет `GFP_KERNEL`;
+- только `atomic64_inc`, `kfifo_in_spinlocked`, `kmalloc(GFP_ATOMIC)`,
+  спинлоки (`spin_lock_irqsave`);
+- никакого `copy_to_user` из probe — весь обмен с userspace
+  происходит в process context внутри `pft_events_read`.
 
-**Per-PID hash with double-checked insertion.**
-First-sight PID allocation must happen outside the spinlock (we can't
-`kmalloc(GFP_ATOMIC)` under a held spinlock with IRQ-save in all configs).
-The probe does:
+**Per-PID hash с double-checked insertion.**
+Аллокация записи для нового PID обязана происходить **вне** удержанного
+спинлока (под спинлоком с IRQ-save `kmalloc(GFP_ATOMIC)` ненадёжен в
+ряде конфигов). Поэтому probe делает так:
 
-1. Lookup under lock; if found, bump and return.
-2. Drop lock; `kmalloc(GFP_ATOMIC)`.
-3. Reacquire lock; *re-check* whether someone else inserted the PID
-   in the meantime; if so, drop our entry. Otherwise, insert.
+1. Lookup под локом; если нашли — инкремент и выход.
+2. Отпускаем лок; `kmalloc(GFP_ATOMIC)`.
+3. Берём лок снова; **повторно проверяем**, не вставил ли этот PID
+   другой CPU за время нашей аллокации; если успел — отбрасываем нашу
+   заготовку. Иначе вставляем.
 
-This is the classical double-checked-locking pattern; without the
-re-check, a parallel probe on another CPU can introduce a duplicate.
+Это классический double-checked locking; без повторной проверки гонка
+с probe на другом CPU породила бы дубликат.
 
-**Two filesystems, two roles.**
-`procfs` carries the stable, human-readable surfaces (`stats`,
-`control`) - the kind of thing a sysadmin would `cat`. `debugfs` carries
-the raw binary event stream (`events`) - the kind of thing a debug or
-profiling tool consumes. This split is idiomatic in modern kernel code.
+**Две файловые системы — две роли.**
+`procfs` несёт стабильные, человекочитаемые поверхности (`stats`,
+`control`) — то, что хотел бы `cat`-нуть админ. `debugfs` несёт сырой
+бинарный поток событий (`events`) — то, что потребляет debug- или
+profiling-инструмент. Такое разделение идиоматично для современного
+ядра.
 
-**Strict teardown order in `pft_exit`.**
+**Строгий порядок teardown в `pft_exit`.**
 
 ```
    unregister probes
-   tracepoint_synchronize_unregister()   <-- wait for in-flight probes
+   tracepoint_synchronize_unregister()   <-- ждём завершения in-flight probe'ов
    proc_remove(...)
    debugfs_remove_recursive(...)
    pft_hash_drain()
 ```
 
-If we remove the debugfs file before in-flight probes finish, a probe
-that just woke up could still call `wake_up_interruptible(&pft_wq)`
-while the wait queue is being torn down by another concurrent reader.
-If we drain the hash before the synchronize, a probe could still insert
-into a half-freed table. The pattern - "stop the producer, wait for the
-producer to quiesce, then dismantle the rest" - is the only race-free
-order.
+Если убрать debugfs-файл до того, как in-flight probe'ы завершатся, —
+probe, проснувшийся на другом CPU, может вызвать
+`wake_up_interruptible(&pft_wq)` уже после того, как очередь ожидания
+ломается другим reader'ом. Если дренировать hash до synchronize —
+probe может вставить запись в полуосвобождённую таблицу. Паттерн
+«остановить producer'а → дождаться, пока producer затихнет → разобрать
+всё остальное» — единственный безопасный порядок.
 
-## Interfaces
+## Интерфейсы
 
-### `/sys/kernel/debug/pft/events` (mode 0400, read-only)
+### `/sys/kernel/debug/pft/events` (права 0400, только read)
 
-A stream of fixed-size `struct pft_event` records, 48 bytes each:
+Поток фиксированных записей `struct pft_event` по 48 байт:
 
-| offset | size | field    | type     |
-|--------|------|----------|----------|
-|  0     |  8   | ts_ns    | u64 (CLOCK_MONOTONIC ns) |
-|  8     |  4   | pid      | u32      |
-| 12     |  4   | tgid     | u32      |
-| 16     | 16   | comm     | char[TASK_COMM_LEN] |
-| 32     |  8   | addr     | u64 (faulting VA) |
-| 40     |  4   | err_code | u32 (X86_PF_* bits) |
-| 44     |  4   | _pad     | u32      |
+| смещение | размер | поле     | тип |
+|----------|--------|----------|------|
+|  0       |  8     | ts_ns    | u64 (CLOCK_MONOTONIC, ns) |
+|  8       |  4     | pid      | u32  |
+| 12       |  4     | tgid     | u32  |
+| 16       | 16     | comm     | char[TASK_COMM_LEN] |
+| 32       |  8     | addr     | u64 (фолтовый VA) |
+| 40       |  4     | err_code | u32 (биты X86_PF_*) |
+| 44       |  4     | _pad     | u32  |
 
-Read is blocking by default; supports `O_NONBLOCK` and `poll(POLLIN)`.
+Read блокирующий по умолчанию; поддерживает `O_NONBLOCK` и
+`poll(POLLIN)`.
 
-### `/proc/pft/stats` (mode 0444, text)
+### `/proc/pft/stats` (права 0444, текст)
 
 ```
-total            <total>
-user             <user>
-kernel           <kernel>
-write            <writes>
-cow_hint         <heuristic CoW count>
-dropped_fifo     <events lost because the ring was full>
-dropped_pid_oom  <per-PID inserts dropped due to GFP_ATOMIC failure>
-filter_pid       <N>   (0 = disabled)
+total            <всего фолтов>
+user             <user-mode фолтов>
+kernel           <kernel-mode фолтов>
+write            <write-фолтов>
+cow_hint         <эвристика CoW>
+dropped_fifo     <событий потеряно — fifo был полон>
+dropped_pid_oom  <per-PID вставок не удалось из-за GFP_ATOMIC>
+filter_pid       <N>   (0 = отключён)
 unique_pids      <N>
 
 top pids:
@@ -163,13 +168,13 @@ top pids:
    ...
 ```
 
-### `/proc/pft/control` (mode 0200, write-only)
+### `/proc/pft/control` (права 0200, только write)
 
-Accepts one command per write:
+Одна команда на одну запись:
 
-- `reset` — zero all counters and drop the per-PID hash.
-- `filter pid N` — keep only events with `current->pid == N`.
-- `filter clear` (or `filter off`) — disable the PID filter.
+- `reset` — обнулить все счётчики и очистить per-PID hash.
+- `filter pid N` — оставить только события с `current->pid == N`.
+- `filter clear` (или `filter off`) — выключить PID-фильтр.
 
 ```sh
 echo "filter pid 42" > /proc/pft/control
@@ -177,99 +182,100 @@ echo reset           > /proc/pft/control
 echo "filter clear"  > /proc/pft/control
 ```
 
-## Decoding `err_code`
+## Расшифровка `err_code`
 
-| bit | name        | 0 means         | 1 means              |
-|-----|-------------|-----------------|----------------------|
-|  0  | `X86_PF_PROT`  | not-present     | present, protection violation |
-|  1  | `X86_PF_WRITE` | read            | write                |
-|  2  | `X86_PF_USER`  | kernel-mode     | user-mode (CPL=3)    |
-|  4  | `X86_PF_INSTR` | data access     | instruction fetch    |
+| бит | имя           | 0 значит        | 1 значит               |
+|-----|---------------|-----------------|------------------------|
+|  0  | `X86_PF_PROT`  | not-present     | страница есть, нарушение защиты |
+|  1  | `X86_PF_WRITE` | read            | write                  |
+|  2  | `X86_PF_USER`  | kernel-mode     | user-mode (CPL=3)      |
+|  4  | `X86_PF_INSTR` | data access     | instruction fetch      |
 
-Common values seen on busybox:
+Типичные значения, которые видно на busybox:
 
-| `ec`  | meaning                                                     |
+| `ec`  | смысл                                                       |
 |-------|-------------------------------------------------------------|
-| 0x04  | user, read, page not present → lazy demand paging           |
-| 0x06  | user, write, not present → first write after `malloc`/`mmap`|
-| 0x07  | user, write, present, not writable → **copy-on-write**       |
-| 0x14  | user, instruction fetch, not present → `.text` page load    |
+| 0x04  | user, read, страницы нет → ленивая подкачка                 |
+| 0x06  | user, write, нет → первая запись после `malloc`/`mmap`      |
+| 0x07  | user, write, страница есть, не writable → **copy-on-write** |
+| 0x14  | user, instruction fetch, нет → подгрузка `.text` страницы   |
 
-## Building & running
+## Сборка и запуск
 
-On the Linux build host:
+На Linux-хосте для сборки:
 
 ```sh
 cd pft
-make            # builds pft.ko, pft-ctl, pft-bench
-make install    # copies them + demo.sh into ../root/
-# rebuild initramfs.gz and boot QEMU as usual
+make            # собирает pft.ko, pft-ctl, pft-bench
+make install    # копирует их + demo.sh в ../root/
+# пересобрать initramfs.gz и запустить QEMU как обычно
 ```
 
-In the QEMU shell:
+В QEMU shell:
 
 ```sh
 mount -t debugfs none /sys/kernel/debug 2>/dev/null
 insmod /pft.ko
-/demo.sh                    # quick end-to-end demonstration
-cat /proc/pft/stats         # aggregated view
-/pft-ctl                    # tail the event stream
+/demo.sh                    # быстрая end-to-end демонстрация
+cat /proc/pft/stats         # агрегированный вид
+/pft-ctl                    # читать поток событий
 ```
 
-## Defense scenario (suggested)
+## Сценарий для защиты
 
-1. `insmod /pft.ko` → show `dmesg | tail`.
-2. `/demo.sh` → end-to-end picture: stats, top PIDs, sample events.
-3. Demonstrate CoW: start `/pft-bench 32` in one process, fork in shell,
-   show `cow_hint` rising.
-4. Demonstrate filtering:
+1. `insmod /pft.ko` → показать `dmesg | tail`.
+2. `/demo.sh` → полная картина: stats, top PIDs, примеры событий.
+3. Показать CoW: запустить `/pft-bench 32`, спровоцировать fork в
+   shell'е, наблюдать рост `cow_hint`.
+4. Показать фильтр:
    ```sh
    /pft-bench 100 &
    echo "filter pid $!" > /proc/pft/control
    wait
-   cat /proc/pft/stats           # only that PID is in stats
+   cat /proc/pft/stats           # только этот PID в статистике
    echo "filter clear" > /proc/pft/control
    ```
-5. Measure overhead with `/pft-bench`:
+5. Измерить overhead через `/pft-bench`:
    ```sh
-   rmmod pft                     # baseline
+   rmmod pft                     # базовая линия
    /pft-bench 10000 5
    insmod /pft.ko
-   /pft-bench 10000 5            # with tracer
+   /pft-bench 10000 5            # с трейсером
    ```
-   Compare per-fault microseconds.
-6. `rmmod pft` → `dmesg | tail` shows final counters; demonstrate safe
-   unload via `tracepoint_synchronize_unregister()`.
+   Сравнить per-fault микросекунды.
+6. `rmmod pft` → `dmesg | tail` покажет итоговые счётчики; объяснить
+   безопасную выгрузку через `tracepoint_synchronize_unregister()`.
 
-## Known limitations
+## Известные ограничения
 
-- **x86-only.** The page-fault tracepoints we consume are defined in
-  `arch/x86/mm/fault.c`. Other architectures expose page faults
-  differently (e.g. `handle_mm_fault` kprobe, perf SW events). Picking
-  one stable interface was deliberate.
-- **minor vs major faults are heuristic.** The page-fault tracepoint
-  fires before the kernel decides whether to read from disk
-  (`do_swap_page`, `filemap_fault`). To get a precise minor/major split
-  we would also need to hook one of those points, or use the perf SW
-  counters `PERF_COUNT_SW_PAGE_FAULTS_{MIN,MAJ}`.
-- **CoW detection is a heuristic.** The combination `X86_PF_WRITE |
-  X86_PF_PROT` covers CoW after `fork()` *and* write-after-`mprotect`.
-  We label this `cow_hint`, not `cow_count`, to be honest.
-- **PID reuse is not tracked.** When PID is recycled after a task exits,
-  the old hash entry survives until module reset. For an educational
-  module that is fine; a production tool would hook `sched_process_exit`.
-- **Ring buffer drops under burst load.** The kfifo holds 1024 events;
-  bursts past that increment `dropped_fifo`. Sizing is a trade-off
-  between memory and capture fidelity.
+- **Только x86.** Page-fault tracepoint'ы, которые мы потребляем,
+  объявлены в `arch/x86/mm/fault.c`. На других архитектурах page fault
+  экспонируется иначе (kprobe на `handle_mm_fault`, perf SW events).
+  Выбор одного стабильного интерфейса — сознательный.
+- **Minor vs major — эвристика.** Tracepoint срабатывает до того, как
+  ядро решает, делать ли I/O с диска (`do_swap_page`, `filemap_fault`).
+  Для точного разделения нужно ещё подцепиться к одному из этих мест
+  или использовать perf SW counters
+  `PERF_COUNT_SW_PAGE_FAULTS_{MIN,MAJ}`.
+- **Детектор CoW — эвристика.** Комбинация `X86_PF_WRITE | X86_PF_PROT`
+  одновременно покрывает CoW после `fork()` *и* write-после-`mprotect`.
+  Поэтому счётчик называется `cow_hint`, а не `cow_count` — это честно.
+- **Переиспользование PID не отслеживается.** Когда PID освобождается
+  после завершения процесса, старая запись в hash живёт до reset.
+  Для учебного модуля это нормально; в production-инструменте надо
+  было бы подцепиться к `sched_process_exit`.
+- **При burst-нагрузке буфер теряет события.** Kfifo вмещает 1024
+  записи; пики свыше этого инкрементируют `dropped_fifo`. Размер —
+  trade-off между памятью и точностью захвата.
 
-## File layout
+## Состав каталога
 
 ```
 pft/
-├── Makefile         build module + userspace tools
-├── pft.c            kernel module
-├── pft-ctl.c        userspace event reader
-├── pft-bench.c      synthetic page-fault generator
-├── demo.sh          one-shot demonstration
-└── README.md        this file
+├── Makefile         сборка модуля и userspace-утилит
+├── pft.c            модуль ядра
+├── pft-ctl.c        userspace reader событий
+├── pft-bench.c      синтетический генератор page fault'ов
+├── demo.sh          одноразовая демонстрация
+└── README.md        этот файл
 ```
