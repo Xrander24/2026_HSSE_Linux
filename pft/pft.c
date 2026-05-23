@@ -5,17 +5,31 @@
 #include <linux/init.h>
 #include <linux/printk.h>
 #include <linux/atomic.h>
+#include <linux/string.h>
 #include <linux/sched.h>      /* current */
 #include <linux/tracepoint.h>
 
-/*
- * We CONSUME these tracepoints - we do NOT define them. So we include
- * the header WITHOUT defining CREATE_TRACE_POINTS (that macro is only
- * used in the single translation unit that owns the tracepoint).
- */
-#include <trace/events/exceptions.h>
-
 #include <asm/trap_pf.h>
+
+/*
+ * Why we do NOT use register_trace_page_fault_user() / the
+ * <trace/events/exceptions.h> macros here:
+ *
+ * The tracepoints page_fault_user / page_fault_kernel are defined
+ * (CREATE_TRACE_POINTS) in arch/x86/mm/fault.c, but the kernel does
+ * not call EXPORT_TRACEPOINT_SYMBOL_GPL() for them. So the symbol
+ * __tracepoint_page_fault_user exists in vmlinux but is invisible to
+ * out-of-tree modules - the linker rejects our .ko with
+ * "modpost: __tracepoint_page_fault_user undefined".
+ *
+ * Workaround (the standard out-of-tree pattern, also used by bpftrace
+ * and SystemTap): iterate the kernel-side list of all tracepoints with
+ * for_each_kernel_tracepoint(), match by name, and attach a probe
+ * via tracepoint_probe_register(). Both helpers ARE exported GPL.
+ */
+
+static struct tracepoint *tp_user;
+static struct tracepoint *tp_kernel;
 
 static atomic64_t pft_total;
 static atomic64_t pft_user;
@@ -45,8 +59,8 @@ static void probe_page_fault_user(void *data,
 	/*
 	 * CoW heuristic: a write that took a protection fault on a page
 	 * that IS present (X86_PF_PROT set) is almost always copy-on-write
-	 * after a fork, or a write to a read-only mapping. It is a
-	 * heuristic, not a guarantee - we'll explain that on defense.
+	 * after a fork, or a write to a read-only mapping. Heuristic, not
+	 * a guarantee - explained on defense.
 	 */
 	if ((error_code & (X86_PF_WRITE | X86_PF_PROT)) ==
 	    (X86_PF_WRITE | X86_PF_PROT))
@@ -69,20 +83,42 @@ static void probe_page_fault_kernel(void *data,
 		atomic64_inc(&pft_write);
 }
 
+/*
+ * Callback for for_each_kernel_tracepoint(). Called once per registered
+ * kernel tracepoint with its struct tracepoint*. We just stash pointers
+ * to the two we care about.
+ */
+static void pft_tp_lookup(struct tracepoint *tp, void *priv)
+{
+	if (!strcmp(tp->name, "page_fault_user"))
+		tp_user = tp;
+	else if (!strcmp(tp->name, "page_fault_kernel"))
+		tp_kernel = tp;
+}
+
 static int __init pft_init(void)
 {
 	int ret;
 
-	ret = register_trace_page_fault_user(probe_page_fault_user, NULL);
+	for_each_kernel_tracepoint(pft_tp_lookup, NULL);
+
+	if (!tp_user || !tp_kernel) {
+		pr_err("pft: could not find page_fault tracepoints (user=%p kernel=%p)\n",
+		       tp_user, tp_kernel);
+		return -ENODEV;
+	}
+
+	ret = tracepoint_probe_register(tp_user, probe_page_fault_user, NULL);
 	if (ret) {
-		pr_err("pft: register page_fault_user failed: %d\n", ret);
+		pr_err("pft: tracepoint_probe_register(user) failed: %d\n", ret);
 		return ret;
 	}
 
-	ret = register_trace_page_fault_kernel(probe_page_fault_kernel, NULL);
+	ret = tracepoint_probe_register(tp_kernel, probe_page_fault_kernel, NULL);
 	if (ret) {
-		pr_err("pft: register page_fault_kernel failed: %d\n", ret);
-		unregister_trace_page_fault_user(probe_page_fault_user, NULL);
+		pr_err("pft: tracepoint_probe_register(kernel) failed: %d\n", ret);
+		tracepoint_probe_unregister(tp_user, probe_page_fault_user, NULL);
+		tracepoint_synchronize_unregister();
 		return ret;
 	}
 
@@ -92,17 +128,19 @@ static int __init pft_init(void)
 
 static void __exit pft_exit(void)
 {
-	unregister_trace_page_fault_user(probe_page_fault_user, NULL);
-	unregister_trace_page_fault_kernel(probe_page_fault_kernel, NULL);
+	if (tp_user)
+		tracepoint_probe_unregister(tp_user, probe_page_fault_user, NULL);
+	if (tp_kernel)
+		tracepoint_probe_unregister(tp_kernel, probe_page_fault_kernel, NULL);
 
 	/*
-	 * unregister_trace_*() only removes the probe from the callback
-	 * list. A probe call may already be in flight on another CPU.
+	 * tracepoint_probe_unregister() only removes the probe from the
+	 * RCU list. A probe call may already be in flight on another CPU.
 	 * tracepoint_synchronize_unregister() waits an RCU grace period
 	 * so we know no probe is running anymore - only then is it safe
 	 * to free probe-touched data and let the module text be unloaded.
-	 * Skipping this call is a classic source of "kernel BUG: unable to
-	 * handle page fault" right after rmmod.
+	 * Skipping this is a classic source of "BUG: unable to handle page
+	 * fault" right after rmmod.
 	 */
 	tracepoint_synchronize_unregister();
 
