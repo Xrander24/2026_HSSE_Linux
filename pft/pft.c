@@ -225,7 +225,7 @@ static const struct file_operations pft_events_fops = {
 	.open    = simple_open,
 	.read    = pft_events_read,
 	.poll    = pft_events_poll,
-	.llseek  = no_llseek,
+	.llseek  = noop_llseek,
 };
 
 /* ===== /proc/pft/stats (seq_file) ===== */
