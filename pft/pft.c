@@ -68,6 +68,14 @@ static atomic64_t pft_cow_hint;
 static atomic64_t pft_dropped;       /* lost due to full fifo */
 static atomic64_t pft_pid_alloc_fail; /* lost due to GFP_ATOMIC OOM in hash */
 
+/*
+ * PID filter: 0 means "trace everything". Any other value means
+ * "only events whose current->pid equals this are recorded".
+ * atomic_t is sufficient - probes read with a single load, writers
+ * (proc_write) update with a single store.
+ */
+static atomic_t pft_filter_pid;
+
 /* ----- debugfs / procfs handles ----- */
 
 static struct dentry         *pft_debug_dir;
@@ -150,11 +158,20 @@ static __always_inline void record_event(unsigned long address,
 	account_pid(ev.pid, ev.tgid, ev.comm);
 }
 
+static __always_inline bool pft_filtered_out(void)
+{
+	int f = atomic_read(&pft_filter_pid);
+	return f && current->pid != f;
+}
+
 static void probe_page_fault_user(void *data,
 				  unsigned long address,
 				  struct pt_regs *regs,
 				  unsigned long error_code)
 {
+	if (pft_filtered_out())
+		return;
+
 	atomic64_inc(&pft_total);
 	atomic64_inc(&pft_user);
 
@@ -172,6 +189,9 @@ static void probe_page_fault_kernel(void *data,
 				    struct pt_regs *regs,
 				    unsigned long error_code)
 {
+	if (pft_filtered_out())
+		return;
+
 	atomic64_inc(&pft_total);
 	atomic64_inc(&pft_kernel);
 
@@ -260,6 +280,8 @@ static int pft_stats_show(struct seq_file *m, void *v)
 		   (long long)atomic64_read(&pft_dropped));
 	seq_printf(m, "dropped_pid_oom  %lld\n",
 		   (long long)atomic64_read(&pft_pid_alloc_fail));
+	seq_printf(m, "filter_pid       %d   (0 = disabled)\n",
+		   atomic_read(&pft_filter_pid));
 
 	/*
 	 * Collect top-N in a single pass through the hash table while
@@ -318,6 +340,88 @@ static const struct proc_ops pft_stats_proc_ops = {
 	.proc_release = single_release,
 };
 
+/* ===== /proc/pft/control (write commands) ===== */
+
+static void pft_reset_all(void)
+{
+	struct pft_pid_stat *e;
+	struct hlist_node *tmp;
+	unsigned long flags;
+	int bkt;
+
+	atomic64_set(&pft_total, 0);
+	atomic64_set(&pft_user, 0);
+	atomic64_set(&pft_kernel, 0);
+	atomic64_set(&pft_write, 0);
+	atomic64_set(&pft_cow_hint, 0);
+	atomic64_set(&pft_dropped, 0);
+	atomic64_set(&pft_pid_alloc_fail, 0);
+
+	spin_lock_irqsave(&pft_pid_lock, flags);
+	hash_for_each_safe(pft_pid_table, bkt, tmp, e, node) {
+		hash_del(&e->node);
+		kfree(e);
+	}
+	spin_unlock_irqrestore(&pft_pid_lock, flags);
+}
+
+/*
+ * Tiny command parser. Accepted commands:
+ *   reset                - zero all counters and drop the per-PID hash
+ *   filter pid <N>       - only record faults with current->pid == N
+ *   filter clear         - disable the PID filter
+ *
+ * Returns count on success so a userspace echo|write consumes the full
+ * line; -EINVAL on unknown command.
+ */
+static ssize_t pft_control_write(struct file *file, const char __user *buf,
+				 size_t count, loff_t *ppos)
+{
+	char kbuf[64];
+	size_t n = count;
+	unsigned int pid;
+
+	if (n == 0)
+		return 0;
+	if (n >= sizeof(kbuf))
+		n = sizeof(kbuf) - 1;
+	if (copy_from_user(kbuf, buf, n))
+		return -EFAULT;
+	kbuf[n] = '\0';
+
+	/* strip trailing newline/CR for friendly echo "..." > control */
+	while (n && (kbuf[n - 1] == '\n' || kbuf[n - 1] == '\r' ||
+		     kbuf[n - 1] == ' '  || kbuf[n - 1] == '\t')) {
+		kbuf[--n] = '\0';
+	}
+
+	if (!strcmp(kbuf, "reset")) {
+		pft_reset_all();
+		pr_info("pft: counters reset\n");
+		return count;
+	}
+	if (!strcmp(kbuf, "filter clear") || !strcmp(kbuf, "filter off")) {
+		atomic_set(&pft_filter_pid, 0);
+		pr_info("pft: filter cleared\n");
+		return count;
+	}
+	if (!strncmp(kbuf, "filter pid ", 11)) {
+		if (kstrtouint(kbuf + 11, 10, &pid))
+			return -EINVAL;
+		atomic_set(&pft_filter_pid, (int)pid);
+		pr_info("pft: filter pid=%u\n", pid);
+		return count;
+	}
+
+	return -EINVAL;
+}
+
+static const struct proc_ops pft_control_proc_ops = {
+	.proc_open  = simple_open,
+	.proc_write = pft_control_write,
+	.proc_lseek = noop_llseek,
+};
+
 /* ===== init / exit ===== */
 
 static void pft_hash_drain(void)
@@ -360,6 +464,11 @@ static int __init pft_init(void)
 	}
 	if (!proc_create("stats", 0444, pft_proc_dir, &pft_stats_proc_ops)) {
 		pr_err("pft: proc_create stats failed\n");
+		ret = -ENOMEM;
+		goto err_proc;
+	}
+	if (!proc_create("control", 0200, pft_proc_dir, &pft_control_proc_ops)) {
+		pr_err("pft: proc_create control failed\n");
 		ret = -ENOMEM;
 		goto err_proc;
 	}
@@ -426,4 +535,4 @@ module_exit(pft_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Xrander24");
 MODULE_DESCRIPTION("Page Fault Tracer (educational)");
-MODULE_VERSION("0.3");
+MODULE_VERSION("0.4");
