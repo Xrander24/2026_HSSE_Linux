@@ -24,5 +24,7 @@ clean:
 install: all
 	cp pft.ko    $(ROOTFS)/
 	cp $(USERAPP) $(ROOTFS)/
+	cp demo.sh   $(ROOTFS)/
+	chmod +x     $(ROOTFS)/demo.sh
 
 .PHONY: all module clean install
