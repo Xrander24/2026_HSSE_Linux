@@ -23,8 +23,7 @@
 
 #include <asm/trap_pf.h>
 
-/* ----- wire-format event (binary ABI to userspace) ----- */
-
+/* Binary record exposed to userspace via /sys/kernel/debug/pft/events. */
 struct pft_event {
 	u64  ts_ns;
 	u32  pid;
@@ -35,14 +34,10 @@ struct pft_event {
 	u32  _pad;
 };
 
-/* ----- ring buffer + reader wait queue ----- */
-
 #define PFT_FIFO_LEN 1024
 static DEFINE_KFIFO(pft_fifo, struct pft_event, PFT_FIFO_LEN);
 static DEFINE_SPINLOCK(pft_fifo_lock);
 static DECLARE_WAIT_QUEUE_HEAD(pft_wq);
-
-/* ----- per-PID stats hash table ----- */
 
 struct pft_pid_stat {
 	u32  pid;
@@ -51,64 +46,44 @@ struct pft_pid_stat {
 	struct hlist_node node;
 };
 
-#define PFT_PID_HASH_BITS 8     /* 256 buckets */
+#define PFT_PID_HASH_BITS 8
 static DEFINE_HASHTABLE(pft_pid_table, PFT_PID_HASH_BITS);
 static DEFINE_SPINLOCK(pft_pid_lock);
 
-/* ----- tracepoint pointers & counters ----- */
-
 static struct tracepoint *tp_user;
 static struct tracepoint *tp_kernel;
+static bool probes_registered;
 
 static atomic64_t pft_total;
 static atomic64_t pft_user;
 static atomic64_t pft_kernel;
 static atomic64_t pft_write;
 static atomic64_t pft_cow_hint;
-static atomic64_t pft_dropped;       /* lost due to full fifo */
-static atomic64_t pft_pid_alloc_fail; /* lost due to GFP_ATOMIC OOM in hash */
-
-/*
- * PID filter: 0 means "trace everything". Any other value means
- * "only events whose current->pid equals this are recorded".
- * atomic_t is sufficient - probes read with a single load, writers
- * (proc_write) update with a single store.
- */
-static atomic_t pft_filter_pid;
-
-/* ----- debugfs / procfs handles ----- */
+static atomic64_t pft_dropped;
+static atomic64_t pft_pid_alloc_fail;
+static atomic_t   pft_filter_pid;
 
 static struct dentry         *pft_debug_dir;
 static struct proc_dir_entry *pft_proc_dir;
 
-/* ----- hot path: bump per-PID counter, allocating an entry if first sight ----- */
-static void account_pid(u32 pid, u32 tgid, const char *comm)
+/* ===== probe path (runs in atomic context: no sleep, no GFP_KERNEL) ===== */
+
+static void account_pid(u32 pid, const char *comm)
 {
-	struct pft_pid_stat *e;
+	struct pft_pid_stat *e, *other;
 	unsigned long flags;
-	bool found = false;
 
 	spin_lock_irqsave(&pft_pid_lock, flags);
 	hash_for_each_possible(pft_pid_table, e, node, pid) {
 		if (e->pid == pid) {
 			e->count++;
-			/* refresh comm in case the task did execve() */
 			memcpy(e->comm, comm, TASK_COMM_LEN);
-			found = true;
-			break;
+			spin_unlock_irqrestore(&pft_pid_lock, flags);
+			return;
 		}
 	}
 	spin_unlock_irqrestore(&pft_pid_lock, flags);
 
-	if (found)
-		return;
-
-	/*
-	 * First-sight PID: allocate a new entry. We're in atomic context
-	 * (probe), so GFP_ATOMIC. If it fails we just drop into a counter -
-	 * the total/global stats are still correct, only per-PID granularity
-	 * suffers.
-	 */
 	e = kmalloc(sizeof(*e), GFP_ATOMIC);
 	if (!e) {
 		atomic64_inc(&pft_pid_alloc_fail);
@@ -118,19 +93,16 @@ static void account_pid(u32 pid, u32 tgid, const char *comm)
 	e->count = 1;
 	memcpy(e->comm, comm, TASK_COMM_LEN);
 
+	/* Double-checked: another CPU may have inserted this PID while we
+	 * were allocating; if so, fold our entry into theirs. */
 	spin_lock_irqsave(&pft_pid_lock, flags);
-	/* Re-check: another CPU may have inserted this PID between
-	 * our lookup and now. If so, drop our fresh entry. */
-	{
-		struct pft_pid_stat *other;
-		hash_for_each_possible(pft_pid_table, other, node, pid) {
-			if (other->pid == pid) {
-				other->count++;
-				memcpy(other->comm, comm, TASK_COMM_LEN);
-				spin_unlock_irqrestore(&pft_pid_lock, flags);
-				kfree(e);
-				return;
-			}
+	hash_for_each_possible(pft_pid_table, other, node, pid) {
+		if (other->pid == pid) {
+			other->count++;
+			memcpy(other->comm, comm, TASK_COMM_LEN);
+			spin_unlock_irqrestore(&pft_pid_lock, flags);
+			kfree(e);
+			return;
 		}
 	}
 	hash_add(pft_pid_table, &e->node, e->pid);
@@ -140,14 +112,13 @@ static void account_pid(u32 pid, u32 tgid, const char *comm)
 static __always_inline void record_event(unsigned long address,
 					 unsigned long error_code)
 {
-	struct pft_event ev;
-
-	ev.ts_ns    = ktime_get_ns();
-	ev.pid      = current->pid;
-	ev.tgid     = current->tgid;
-	ev.addr     = address;
-	ev.err_code = (u32)error_code;
-	ev._pad     = 0;
+	struct pft_event ev = {
+		.ts_ns    = ktime_get_ns(),
+		.pid      = current->pid,
+		.tgid     = current->tgid,
+		.addr     = address,
+		.err_code = (u32)error_code,
+	};
 	memcpy(ev.comm, current->comm, sizeof(ev.comm));
 
 	if (!kfifo_in_spinlocked(&pft_fifo, &ev, 1, &pft_fifo_lock))
@@ -155,7 +126,7 @@ static __always_inline void record_event(unsigned long address,
 	else
 		wake_up_interruptible(&pft_wq);
 
-	account_pid(ev.pid, ev.tgid, ev.comm);
+	account_pid(ev.pid, ev.comm);
 }
 
 static __always_inline bool pft_filtered_out(void)
@@ -164,17 +135,14 @@ static __always_inline bool pft_filtered_out(void)
 	return f && current->pid != f;
 }
 
-static void probe_page_fault_user(void *data,
-				  unsigned long address,
-				  struct pt_regs *regs,
-				  unsigned long error_code)
+static void probe_page_fault_user(void *data, unsigned long address,
+				  struct pt_regs *regs, unsigned long error_code)
 {
 	if (pft_filtered_out())
 		return;
 
 	atomic64_inc(&pft_total);
 	atomic64_inc(&pft_user);
-
 	if (error_code & X86_PF_WRITE)
 		atomic64_inc(&pft_write);
 	if ((error_code & (X86_PF_WRITE | X86_PF_PROT)) ==
@@ -184,23 +152,23 @@ static void probe_page_fault_user(void *data,
 	record_event(address, error_code);
 }
 
-static void probe_page_fault_kernel(void *data,
-				    unsigned long address,
-				    struct pt_regs *regs,
-				    unsigned long error_code)
+static void probe_page_fault_kernel(void *data, unsigned long address,
+				    struct pt_regs *regs, unsigned long error_code)
 {
 	if (pft_filtered_out())
 		return;
 
 	atomic64_inc(&pft_total);
 	atomic64_inc(&pft_kernel);
-
 	if (error_code & X86_PF_WRITE)
 		atomic64_inc(&pft_write);
 
 	record_event(address, error_code);
 }
 
+/* The page_fault tracepoints exist in vmlinux but are NOT exported via
+ * EXPORT_TRACEPOINT_SYMBOL_GPL, so register_trace_*() won't link from a
+ * module. Walk the kernel-side list and match by name instead. */
 static void pft_tp_lookup(struct tracepoint *tp, void *priv)
 {
 	if (!strcmp(tp->name, "page_fault_user"))
@@ -220,24 +188,19 @@ static ssize_t pft_events_read(struct file *file, char __user *buf,
 	if (kfifo_is_empty(&pft_fifo)) {
 		if (file->f_flags & O_NONBLOCK)
 			return -EAGAIN;
-		ret = wait_event_interruptible(pft_wq,
-					       !kfifo_is_empty(&pft_fifo));
+		ret = wait_event_interruptible(pft_wq, !kfifo_is_empty(&pft_fifo));
 		if (ret)
 			return ret;
 	}
 
 	ret = kfifo_to_user(&pft_fifo, buf, count, &copied);
-	if (ret)
-		return ret;
-	return copied;
+	return ret ? ret : copied;
 }
 
 static __poll_t pft_events_poll(struct file *file, poll_table *wait)
 {
 	poll_wait(file, &pft_wq, wait);
-	if (!kfifo_is_empty(&pft_fifo))
-		return EPOLLIN | EPOLLRDNORM;
-	return 0;
+	return kfifo_is_empty(&pft_fifo) ? 0 : (EPOLLIN | EPOLLRDNORM);
 }
 
 static const struct file_operations pft_events_fops = {
@@ -248,7 +211,7 @@ static const struct file_operations pft_events_fops = {
 	.llseek  = noop_llseek,
 };
 
-/* ===== /proc/pft/stats (seq_file) ===== */
+/* ===== /proc/pft/stats ===== */
 
 #define PFT_TOP_N 5
 
@@ -263,31 +226,19 @@ static int pft_stats_show(struct seq_file *m, void *v)
 	struct pft_top_entry top[PFT_TOP_N] = {0};
 	struct pft_pid_stat *e;
 	unsigned long flags;
-	int bkt, i, j;
 	unsigned int unique = 0;
+	int bkt, i, j;
 
-	seq_printf(m, "total            %lld\n",
-		   (long long)atomic64_read(&pft_total));
-	seq_printf(m, "user             %lld\n",
-		   (long long)atomic64_read(&pft_user));
-	seq_printf(m, "kernel           %lld\n",
-		   (long long)atomic64_read(&pft_kernel));
-	seq_printf(m, "write            %lld\n",
-		   (long long)atomic64_read(&pft_write));
-	seq_printf(m, "cow_hint         %lld\n",
-		   (long long)atomic64_read(&pft_cow_hint));
-	seq_printf(m, "dropped_fifo     %lld\n",
-		   (long long)atomic64_read(&pft_dropped));
-	seq_printf(m, "dropped_pid_oom  %lld\n",
-		   (long long)atomic64_read(&pft_pid_alloc_fail));
+	seq_printf(m, "total            %lld\n", (long long)atomic64_read(&pft_total));
+	seq_printf(m, "user             %lld\n", (long long)atomic64_read(&pft_user));
+	seq_printf(m, "kernel           %lld\n", (long long)atomic64_read(&pft_kernel));
+	seq_printf(m, "write            %lld\n", (long long)atomic64_read(&pft_write));
+	seq_printf(m, "cow_hint         %lld\n", (long long)atomic64_read(&pft_cow_hint));
+	seq_printf(m, "dropped_fifo     %lld\n", (long long)atomic64_read(&pft_dropped));
+	seq_printf(m, "dropped_pid_oom  %lld\n", (long long)atomic64_read(&pft_pid_alloc_fail));
 	seq_printf(m, "filter_pid       %d   (0 = disabled)\n",
 		   atomic_read(&pft_filter_pid));
 
-	/*
-	 * Collect top-N in a single pass through the hash table while
-	 * holding the spinlock. We keep top[] as an unsorted small set
-	 * with a running minimum index - O(N * top_n), fine for top_n=5.
-	 */
 	spin_lock_irqsave(&pft_pid_lock, flags);
 	hash_for_each(pft_pid_table, bkt, e, node) {
 		int min_i = 0;
@@ -303,7 +254,6 @@ static int pft_stats_show(struct seq_file *m, void *v)
 	}
 	spin_unlock_irqrestore(&pft_pid_lock, flags);
 
-	/* Insertion sort by count desc - PFT_TOP_N is tiny. */
 	for (i = 1; i < PFT_TOP_N; i++) {
 		struct pft_top_entry key = top[i];
 		j = i - 1;
@@ -321,8 +271,7 @@ static int pft_stats_show(struct seq_file *m, void *v)
 		if (!top[i].count)
 			continue;
 		seq_printf(m, "%6u %7u %.*s\n",
-			   top[i].pid, top[i].count,
-			   TASK_COMM_LEN, top[i].comm);
+			   top[i].pid, top[i].count, TASK_COMM_LEN, top[i].comm);
 	}
 
 	return 0;
@@ -340,22 +289,14 @@ static const struct proc_ops pft_stats_proc_ops = {
 	.proc_release = single_release,
 };
 
-/* ===== /proc/pft/control (write commands) ===== */
+/* ===== /proc/pft/control ===== */
 
-static void pft_reset_all(void)
+static void pft_hash_drain(void)
 {
 	struct pft_pid_stat *e;
 	struct hlist_node *tmp;
 	unsigned long flags;
 	int bkt;
-
-	atomic64_set(&pft_total, 0);
-	atomic64_set(&pft_user, 0);
-	atomic64_set(&pft_kernel, 0);
-	atomic64_set(&pft_write, 0);
-	atomic64_set(&pft_cow_hint, 0);
-	atomic64_set(&pft_dropped, 0);
-	atomic64_set(&pft_pid_alloc_fail, 0);
 
 	spin_lock_irqsave(&pft_pid_lock, flags);
 	hash_for_each_safe(pft_pid_table, bkt, tmp, e, node) {
@@ -365,15 +306,19 @@ static void pft_reset_all(void)
 	spin_unlock_irqrestore(&pft_pid_lock, flags);
 }
 
-/*
- * Tiny command parser. Accepted commands:
- *   reset                - zero all counters and drop the per-PID hash
- *   filter pid <N>       - only record faults with current->pid == N
- *   filter clear         - disable the PID filter
- *
- * Returns count on success so a userspace echo|write consumes the full
- * line; -EINVAL on unknown command.
- */
+static void pft_reset_all(void)
+{
+	atomic64_set(&pft_total, 0);
+	atomic64_set(&pft_user, 0);
+	atomic64_set(&pft_kernel, 0);
+	atomic64_set(&pft_write, 0);
+	atomic64_set(&pft_cow_hint, 0);
+	atomic64_set(&pft_dropped, 0);
+	atomic64_set(&pft_pid_alloc_fail, 0);
+	pft_hash_drain();
+}
+
+/* Commands: "reset", "filter pid <N>", "filter clear" / "filter off". */
 static ssize_t pft_control_write(struct file *file, const char __user *buf,
 				 size_t count, loff_t *ppos)
 {
@@ -389,11 +334,9 @@ static ssize_t pft_control_write(struct file *file, const char __user *buf,
 		return -EFAULT;
 	kbuf[n] = '\0';
 
-	/* strip trailing newline/CR for friendly echo "..." > control */
 	while (n && (kbuf[n - 1] == '\n' || kbuf[n - 1] == '\r' ||
-		     kbuf[n - 1] == ' '  || kbuf[n - 1] == '\t')) {
+		     kbuf[n - 1] == ' '  || kbuf[n - 1] == '\t'))
 		kbuf[--n] = '\0';
-	}
 
 	if (!strcmp(kbuf, "reset")) {
 		pft_reset_all();
@@ -422,25 +365,30 @@ static const struct proc_ops pft_control_proc_ops = {
 	.proc_lseek = noop_llseek,
 };
 
-/* ===== init / exit ===== */
+/* ===== init / exit =====
+ *
+ * Teardown order matters: stop the producer first (unregister probes +
+ * synchronize RCU), then dismantle the consumer surfaces (procfs,
+ * debugfs), then free per-PID state. Doing it any other way races
+ * with in-flight probes on other CPUs.
+ */
 
-static void pft_hash_drain(void)
+static void pft_cleanup(void)
 {
-	struct pft_pid_stat *e;
-	struct hlist_node *tmp;
-	int bkt;
-
-	/*
-	 * Called only after tracepoint_synchronize_unregister(), so we
-	 * know no probe is concurrently inserting. No lock needed, but
-	 * we take it anyway for symmetry / future-proofing.
-	 */
-	spin_lock(&pft_pid_lock);
-	hash_for_each_safe(pft_pid_table, bkt, tmp, e, node) {
-		hash_del(&e->node);
-		kfree(e);
+	if (probes_registered) {
+		tracepoint_probe_unregister(tp_user,   probe_page_fault_user,   NULL);
+		tracepoint_probe_unregister(tp_kernel, probe_page_fault_kernel, NULL);
+		tracepoint_synchronize_unregister();
+		probes_registered = false;
 	}
-	spin_unlock(&pft_pid_lock);
+
+	proc_remove(pft_proc_dir);
+	pft_proc_dir = NULL;
+
+	debugfs_remove_recursive(pft_debug_dir);
+	pft_debug_dir = NULL;
+
+	pft_hash_drain();
 }
 
 static int __init pft_init(void)
@@ -450,7 +398,7 @@ static int __init pft_init(void)
 	pft_debug_dir = debugfs_create_dir("pft", NULL);
 	if (IS_ERR(pft_debug_dir)) {
 		ret = PTR_ERR(pft_debug_dir);
-		pr_err("pft: debugfs_create_dir failed: %d\n", ret);
+		pft_debug_dir = NULL;
 		return ret;
 	}
 	debugfs_create_file("events", 0400, pft_debug_dir, NULL,
@@ -458,67 +406,47 @@ static int __init pft_init(void)
 
 	pft_proc_dir = proc_mkdir("pft", NULL);
 	if (!pft_proc_dir) {
-		pr_err("pft: proc_mkdir failed\n");
-		ret = -ENOMEM;
-		goto err_debugfs;
+		pft_cleanup();
+		return -ENOMEM;
 	}
 	if (!proc_create("stats", 0444, pft_proc_dir, &pft_stats_proc_ops)) {
-		pr_err("pft: proc_create stats failed\n");
-		ret = -ENOMEM;
-		goto err_proc;
+		pft_cleanup();
+		return -ENOMEM;
 	}
 	if (!proc_create("control", 0200, pft_proc_dir, &pft_control_proc_ops)) {
-		pr_err("pft: proc_create control failed\n");
-		ret = -ENOMEM;
-		goto err_proc;
+		pft_cleanup();
+		return -ENOMEM;
 	}
 
 	for_each_kernel_tracepoint(pft_tp_lookup, NULL);
 	if (!tp_user || !tp_kernel) {
 		pr_err("pft: page_fault tracepoints not found\n");
-		ret = -ENODEV;
-		goto err_proc;
+		pft_cleanup();
+		return -ENODEV;
 	}
 
 	ret = tracepoint_probe_register(tp_user, probe_page_fault_user, NULL);
 	if (ret) {
-		pr_err("pft: register(user) failed: %d\n", ret);
-		goto err_proc;
+		pft_cleanup();
+		return ret;
 	}
 	ret = tracepoint_probe_register(tp_kernel, probe_page_fault_kernel, NULL);
 	if (ret) {
-		pr_err("pft: register(kernel) failed: %d\n", ret);
 		tracepoint_probe_unregister(tp_user, probe_page_fault_user, NULL);
 		tracepoint_synchronize_unregister();
-		goto err_proc;
+		pft_cleanup();
+		return ret;
 	}
+	probes_registered = true;
 
 	pr_info("pft: loaded - /proc/pft/stats, /sys/kernel/debug/pft/events (record=%zu B)\n",
 		sizeof(struct pft_event));
 	return 0;
-
-err_proc:
-	proc_remove(pft_proc_dir);
-	pft_proc_dir = NULL;
-err_debugfs:
-	debugfs_remove_recursive(pft_debug_dir);
-	pft_debug_dir = NULL;
-	return ret;
 }
 
 static void __exit pft_exit(void)
 {
-	if (tp_user)
-		tracepoint_probe_unregister(tp_user, probe_page_fault_user, NULL);
-	if (tp_kernel)
-		tracepoint_probe_unregister(tp_kernel, probe_page_fault_kernel, NULL);
-
-	tracepoint_synchronize_unregister();
-
-	proc_remove(pft_proc_dir);
-	debugfs_remove_recursive(pft_debug_dir);
-
-	pft_hash_drain();
+	pft_cleanup();
 
 	pr_info("pft: unloaded - total=%lld user=%lld kernel=%lld write=%lld cow_hint=%lld dropped=%lld\n",
 		(long long)atomic64_read(&pft_total),
@@ -535,4 +463,4 @@ module_exit(pft_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Xrander24");
 MODULE_DESCRIPTION("Page Fault Tracer (educational)");
-MODULE_VERSION("0.4");
+MODULE_VERSION("0.5");
